@@ -39,6 +39,17 @@ const PORT_RANGE_END   = Number(process.env.PORT_RANGE_END   || 6999);
 const MAX_INSTANCES    = Number(process.env.MAX_INSTANCES    || 10);
 const LAUNCH_RESIZE = process.env.LAUNCH_RESIZE || 'remote';
 const LAUNCH_VIEW_ONLY = String(process.env.LAUNCH_VIEW_ONLY || 'false').toLowerCase() === 'true';
+const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN || '';
+const CLOUDFLARE_API_KEY = process.env.CLOUDFLARE_API_KEY || '';
+const CLOUDFLARE_EMAIL = process.env.CLOUDFLARE_EMAIL || '';
+const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || '';
+const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID || '';
+const CLOUDFLARE_TUNNEL_ID = process.env.CLOUDFLARE_TUNNEL_ID || '';
+const CLOUDFLARE_BASE_DOMAIN = String(process.env.CLOUDFLARE_BASE_DOMAIN || '').trim().toLowerCase();
+const CLOUDFLARE_TUNNEL_SERVICE_HOST = process.env.CLOUDFLARE_TUNNEL_SERVICE_HOST || 'host.docker.internal';
+const CLOUDFLARE_DNS_PROXIED = String(process.env.CLOUDFLARE_DNS_PROXIED || 'true').toLowerCase() === 'true';
+const CLOUDFLARE_TUNNEL_SERVICE_SCHEME = String(process.env.CLOUDFLARE_TUNNEL_SERVICE_SCHEME || 'https').toLowerCase();
+const CLOUDFLARE_TUNNEL_NO_TLS_VERIFY = String(process.env.CLOUDFLARE_TUNNEL_NO_TLS_VERIFY || 'true').toLowerCase() === 'true';
 
 ensureStore();
 
@@ -328,6 +339,224 @@ function presentInstance(instance, inspect = null) {
     ports: inspect?.NetworkSettings?.Ports || null,
     launchUrl: buildLaunchUrl(instance),
     pathPrefix: `/${instance.hostPort}`,
+    cloudflare: {
+      published: Boolean(instance.cloudflare?.published),
+      hostname: instance.cloudflare?.hostname || null,
+      routeCreatedAt: instance.cloudflare?.routeCreatedAt || null,
+      dnsCreatedAt: instance.cloudflare?.dnsCreatedAt || null,
+      lastPublishedAt: instance.cloudflare?.lastPublishedAt || null,
+      lastError: instance.cloudflare?.lastError || null,
+    },
+  };
+}
+
+function cloudflareConfigured() {
+  const hasAuth = Boolean(CLOUDFLARE_API_TOKEN) || (Boolean(CLOUDFLARE_API_KEY) && Boolean(CLOUDFLARE_EMAIL));
+  return hasAuth && Boolean(CLOUDFLARE_ACCOUNT_ID) && Boolean(CLOUDFLARE_ZONE_ID) && Boolean(CLOUDFLARE_TUNNEL_ID) && Boolean(CLOUDFLARE_BASE_DOMAIN);
+}
+
+function cloudflareAuthHeaders() {
+  if (CLOUDFLARE_API_TOKEN) return { Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}` };
+  if (CLOUDFLARE_API_KEY && CLOUDFLARE_EMAIL) {
+    return { 'X-Auth-Key': CLOUDFLARE_API_KEY, 'X-Auth-Email': CLOUDFLARE_EMAIL };
+  }
+  throw new Error('Cloudflare credentials are not configured.');
+}
+
+function normalizeHostname(value) {
+  return String(value || '').trim().toLowerCase().replace(/\.+$/, '');
+}
+
+function isAllowedCloudflareHostname(hostname) {
+  const normalized = normalizeHostname(hostname);
+  if (!normalized || !CLOUDFLARE_BASE_DOMAIN) return false;
+  return normalized === CLOUDFLARE_BASE_DOMAIN || normalized.endsWith(`.${CLOUDFLARE_BASE_DOMAIN}`);
+}
+
+function resolvePublishHostname(instance, requestedHostname = '') {
+  const candidate = requestedHostname || `${instance.slug}.${CLOUDFLARE_BASE_DOMAIN}`;
+  const hostname = normalizeHostname(candidate);
+  if (!hostname) throw new Error('A hostname is required to publish this instance.');
+  if (!isAllowedCloudflareHostname(hostname)) {
+    throw new Error(`Hostname must be under the allowed base domain (${CLOUDFLARE_BASE_DOMAIN}).`);
+  }
+  return hostname;
+}
+
+function buildTunnelServiceUrl(instance) {
+  const scheme = CLOUDFLARE_TUNNEL_SERVICE_SCHEME === 'http' ? 'http' : 'https';
+  return `${scheme}://${CLOUDFLARE_TUNNEL_SERVICE_HOST}:${Number(instance.hostPort)}`;
+}
+
+async function cloudflareRequest(method, endpoint, body = undefined) {
+  const url = `https://api.cloudflare.com/client/v4${endpoint}`;
+  const headers = { 'Content-Type': 'application/json', ...cloudflareAuthHeaders() };
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.success === false) {
+    const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+    const detail = errors.length
+      ? errors.map((item) => item?.message || JSON.stringify(item)).join('; ')
+      : (Array.isArray(payload?.messages) ? payload.messages.join('; ') : '');
+    throw new Error(`Cloudflare API error (${response.status}): ${detail || 'Request failed'}`);
+  }
+  return payload.result;
+}
+
+function isCloudflareNotFound(error) {
+  const text = String(error?.message || '');
+  return /404|not found|does not exist/i.test(text);
+}
+
+async function getTunnelIngress() {
+  const result = await cloudflareRequest('GET', `/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/${CLOUDFLARE_TUNNEL_ID}/configurations`);
+  const config = result?.config || {};
+  const ingress = Array.isArray(config.ingress) ? config.ingress : [];
+  return { config, ingress };
+}
+
+function ensureCatchAllIngress(ingress = []) {
+  const rules = Array.isArray(ingress) ? [...ingress] : [];
+  const hasCatchAll = rules.some((rule) => !rule?.hostname && Boolean(rule?.service));
+  if (!hasCatchAll) rules.push({ service: 'http_status:404' });
+  return rules;
+}
+
+async function saveTunnelIngress(config, ingress) {
+  return cloudflareRequest('PUT', `/accounts/${CLOUDFLARE_ACCOUNT_ID}/cfd_tunnel/${CLOUDFLARE_TUNNEL_ID}/configurations`, {
+    config: { ...config, ingress: ensureCatchAllIngress(ingress) },
+  });
+}
+
+async function upsertTunnelRoute(hostname, service) {
+  const { config, ingress } = await getTunnelIngress();
+  const nextIngress = ingress.filter((rule) => normalizeHostname(rule?.hostname) !== hostname);
+  nextIngress.unshift({
+    hostname,
+    service,
+    originRequest: {
+      noTLSVerify: CLOUDFLARE_TUNNEL_NO_TLS_VERIFY,
+    },
+  });
+  await saveTunnelIngress(config, nextIngress);
+}
+
+async function deleteTunnelRoute(hostname) {
+  const { config, ingress } = await getTunnelIngress();
+  const nextIngress = ingress.filter((rule) => normalizeHostname(rule?.hostname) !== hostname);
+  await saveTunnelIngress(config, nextIngress);
+}
+
+async function upsertTunnelDnsRecord(hostname) {
+  const existing = await cloudflareRequest(
+    'GET',
+    `/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=CNAME&name=${encodeURIComponent(hostname)}&per_page=1`,
+  );
+  const target = `${CLOUDFLARE_TUNNEL_ID}.cfargotunnel.com`;
+  if (Array.isArray(existing) && existing[0]) {
+    const record = existing[0];
+    await cloudflareRequest('PUT', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${record.id}`, {
+      type: 'CNAME',
+      name: hostname,
+      content: target,
+      proxied: CLOUDFLARE_DNS_PROXIED,
+      ttl: 1,
+    });
+    return record.id;
+  }
+  const created = await cloudflareRequest('POST', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records`, {
+    type: 'CNAME',
+    name: hostname,
+    content: target,
+    proxied: CLOUDFLARE_DNS_PROXIED,
+    ttl: 1,
+  });
+  return created?.id || null;
+}
+
+async function deleteTunnelDnsRecord(hostname, knownRecordId = null) {
+  if (knownRecordId) {
+    try {
+      await cloudflareRequest('DELETE', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${knownRecordId}`);
+      return;
+    } catch (error) {
+      if (!isCloudflareNotFound(error)) throw error;
+    }
+  }
+
+  const records = await cloudflareRequest(
+    'GET',
+    `/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=CNAME&name=${encodeURIComponent(hostname)}&per_page=50`,
+  );
+  for (const record of records || []) {
+    try {
+      await cloudflareRequest('DELETE', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${record.id}`);
+    } catch (error) {
+      if (!isCloudflareNotFound(error)) throw error;
+    }
+  }
+}
+
+async function publishInstanceCloudflare(instance, requestedHostname = '') {
+  if (!cloudflareConfigured()) throw new Error('Cloudflare publishing is not configured on this server.');
+  const hostname = resolvePublishHostname(instance, requestedHostname);
+  const service = buildTunnelServiceUrl(instance);
+  await upsertTunnelRoute(hostname, service);
+  let dnsRecordId = null;
+  try {
+    dnsRecordId = await upsertTunnelDnsRecord(hostname);
+  } catch (error) {
+    // Best-effort rollback so we do not leave a route without DNS.
+    await deleteTunnelRoute(hostname).catch(() => {});
+    throw error;
+  }
+  const now = new Date().toISOString();
+  return {
+    published: true,
+    hostname,
+    service,
+    dnsRecordId,
+    routeCreatedAt: now,
+    dnsCreatedAt: now,
+    lastPublishedAt: now,
+    lastError: null,
+  };
+}
+
+async function unpublishInstanceCloudflare(instance) {
+  const cf = instance?.cloudflare || {};
+  const hostname = normalizeHostname(cf.hostname);
+  if (!hostname) {
+    return {
+      published: false,
+      hostname: null,
+      service: null,
+      dnsRecordId: null,
+      routeCreatedAt: null,
+      dnsCreatedAt: null,
+      lastPublishedAt: cf.lastPublishedAt || null,
+      lastError: null,
+    };
+  }
+  await deleteTunnelRoute(hostname).catch((error) => {
+    if (!isCloudflareNotFound(error)) throw error;
+  });
+  await deleteTunnelDnsRecord(hostname, cf.dnsRecordId || null).catch((error) => {
+    if (!isCloudflareNotFound(error)) throw error;
+  });
+  return {
+    published: false,
+    hostname: null,
+    service: null,
+    dnsRecordId: null,
+    routeCreatedAt: null,
+    dnsCreatedAt: null,
+    lastPublishedAt: cf.lastPublishedAt || null,
+    lastError: null,
   };
 }
 
@@ -420,7 +649,12 @@ function serveStatic(req, res) {
     '.js': 'application/javascript; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
   };
-  sendText(res, 200, fs.readFileSync(filePath), types[ext] || 'application/octet-stream');
+  const cacheHeaders = {
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+  };
+  sendText(res, 200, fs.readFileSync(filePath), types[ext] || 'application/octet-stream', cacheHeaders);
 }
 
 function readProcCpuTimes() {
@@ -747,6 +981,8 @@ async function handleApi(req, res, url) {
         portRangeEnd: PORT_RANGE_END,
         maxInstances: MAX_INSTANCES,
         instanceCount: getInstances().length,
+        cloudflareConfigured: cloudflareConfigured(),
+        cloudflareBaseDomain: CLOUDFLARE_BASE_DOMAIN || null,
       });
     }
 
@@ -854,6 +1090,16 @@ async function handleApi(req, res, url) {
         createdAt: new Date().toISOString(),
         status: 'creating',
         containerId: null,
+        cloudflare: {
+          published: false,
+          hostname: null,
+          service: null,
+          dnsRecordId: null,
+          routeCreatedAt: null,
+          dnsCreatedAt: null,
+          lastPublishedAt: null,
+          lastError: null,
+        },
       };
 
       instance.status = 'pulling';
@@ -907,6 +1153,24 @@ async function handleApi(req, res, url) {
       }
 
       if (req.method === 'DELETE' && !action) {
+        if (instance.cloudflare?.published || instance.cloudflare?.hostname) {
+          try {
+            const unpublished = await unpublishInstanceCloudflare(instance);
+            updateInstance(instance.id, (item) => ({ ...item, cloudflare: unpublished }));
+          } catch (error) {
+            const failed = updateInstance(instance.id, (item) => ({
+              ...item,
+              cloudflare: {
+                ...(item.cloudflare || {}),
+                lastError: error.message,
+              },
+            }));
+            return sendJson(res, 409, {
+              error: `Failed to remove Cloudflare route for "${instance.name}": ${error.message}`,
+              instance: failed ? presentInstance(failed) : undefined,
+            });
+          }
+        }
         if (instance.containerId) {
           try { await removeContainer(instance.containerId, true); } catch {}
         } else {
@@ -919,6 +1183,32 @@ async function handleApi(req, res, url) {
         removeInstance(instance.id);
         return sendJson(res, 200, { ok: true });
       }
+    }
+
+    const publishMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/publish$/);
+    if (req.method === 'POST' && publishMatch) {
+      const instance = getInstance(publishMatch[1]);
+      if (!instance) return sendJson(res, 404, { error: 'Instance not found.' });
+      const body = await readBody(req);
+      const hostname = body?.hostname ? String(body.hostname) : '';
+      const cloudflare = await publishInstanceCloudflare(instance, hostname);
+      const updated = updateInstance(instance.id, (item) => ({
+        ...item,
+        cloudflare,
+      }));
+      return sendJson(res, 200, { instance: presentInstance(updated) });
+    }
+
+    const unpublishMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/unpublish$/);
+    if (req.method === 'POST' && unpublishMatch) {
+      const instance = getInstance(unpublishMatch[1]);
+      if (!instance) return sendJson(res, 404, { error: 'Instance not found.' });
+      const cloudflare = await unpublishInstanceCloudflare(instance);
+      const updated = updateInstance(instance.id, (item) => ({
+        ...item,
+        cloudflare,
+      }));
+      return sendJson(res, 200, { instance: presentInstance(updated) });
     }
 
     return sendJson(res, 404, { error: 'Not found' });

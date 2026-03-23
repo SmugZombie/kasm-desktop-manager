@@ -204,12 +204,18 @@ function startPollingIfNeeded(instances) {
 function instanceCard(inst) {
   const isPending = TRANSIENT_STATES.has(inst.state);
   const isError = inst.state === 'error';
+  const isPublished = Boolean(inst.cloudflare?.published && inst.cloudflare?.hostname);
   const card = document.createElement('div');
   card.className = `instance-card${isPending ? ' is-pending' : ''}${isError ? ' is-error' : ''}`;
 
+  const cloudflareAction = appConfig.cloudflareConfigured
+    ? `<button class="btn btn-outline btn-sm" data-action="${isPublished ? 'unpublish' : 'publish'}">${isPublished ? 'Unpublish' : 'Publish'}</button>`
+    : '';
   const actionsHtml = isPending ? '' : `
     <button class="btn btn-primary btn-sm" data-action="launch">Launch</button>
     <button class="btn btn-outline btn-sm" data-action="open-route">Open /${inst.hostPort}/</button>
+    <button class="btn btn-outline btn-sm" data-action="copy-password">Copy Password</button>
+    ${cloudflareAction}
     <button class="btn btn-outline btn-sm" data-action="start">Start</button>
     <button class="btn btn-outline btn-sm" data-action="stop">Stop</button>
     <button class="btn btn-outline btn-sm" data-action="reset">Reset</button>
@@ -232,6 +238,7 @@ function instanceCard(inst) {
       <span class="meta-sep">·</span>
       <span class="meta-tag">Proxy <a href="${inst.pathPrefix}/" target="_blank" rel="noopener">${inst.pathPrefix}/</a></span>
       ` : ''}
+      ${inst.cloudflare?.hostname ? `<span class="meta-sep">·</span><span class="meta-tag">Cloudflare <a href="https://${inst.cloudflare.hostname}" target="_blank" rel="noopener">${inst.cloudflare.hostname}</a></span>` : ''}
       ${inst.persistentProfile ? `<span class="meta-sep">·</span><span class="meta-tag">📁 Profile</span>` : ''}
       ${inst.containerId ? `<span class="meta-sep">·</span><span class="meta-tag" style="font-family:monospace;font-size:11px">${inst.containerId.slice(0,12)}</span>` : ''}
     </div>
@@ -244,6 +251,23 @@ function instanceCard(inst) {
       try {
         if (action === 'launch') { window.open(`/launch/${inst.id}`, '_blank', 'noopener'); return; }
         if (action === 'open-route') { window.open(`${inst.pathPrefix}/`, '_blank', 'noopener'); return; }
+        if (action === 'copy-password') {
+          await navigator.clipboard.writeText(inst.password || '');
+          showAlert(messageEl, `Password copied for "${inst.name}".`, 'success');
+          return;
+        }
+        if (action === 'publish') {
+          const defaultHost = `${inst.slug}.${appConfig.cloudflareBaseDomain || ''}`.replace(/\.+$/, '');
+          const hostnameInput = prompt('Cloudflare hostname to publish (must be within allowed base domain):', defaultHost);
+          if (hostnameInput == null) return;
+          await api(`/api/instances/${inst.id}/publish`, {
+            method: 'POST',
+            body: JSON.stringify({ hostname: hostnameInput.trim() }),
+          });
+        }
+        if (action === 'unpublish') {
+          await api(`/api/instances/${inst.id}/unpublish`, { method: 'POST' });
+        }
         if (action === 'start')  await api(`/api/instances/${inst.id}/start`, { method: 'POST' });
         if (action === 'stop')   await api(`/api/instances/${inst.id}/stop`, { method: 'POST' });
         if (action === 'reset')  await api(`/api/instances/${inst.id}/reset`, { method: 'POST', body: JSON.stringify({ clearProfile: false }) });

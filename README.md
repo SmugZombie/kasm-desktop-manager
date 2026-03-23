@@ -81,7 +81,45 @@ PROXY_TEXT_REWRITE=true
 LAUNCH_AUTOCONNECT=true
 LAUNCH_RESIZE=remote
 LAUNCH_VIEW_ONLY=false
+
+# Optional: Cloudflare Tunnel publish/unpublish
+CLOUDFLARE_API_TOKEN=
+# or API key auth:
+# CLOUDFLARE_API_KEY=
+# CLOUDFLARE_EMAIL=
+CLOUDFLARE_ACCOUNT_ID=
+CLOUDFLARE_ZONE_ID=
+CLOUDFLARE_TUNNEL_ID=
+CLOUDFLARE_BASE_DOMAIN=
+CLOUDFLARE_TUNNEL_SERVICE_HOST=host.docker.internal
+CLOUDFLARE_TUNNEL_SERVICE_SCHEME=https
+CLOUDFLARE_TUNNEL_NO_TLS_VERIFY=true
+CLOUDFLARE_DNS_PROXIED=true
 ```
+
+## Cloudflare publish workflow
+
+This project supports publishing a desktop to Cloudflare on demand with a single pre-existing tunnel.
+
+- New desktops are **not published by default**.
+- Each instance card has a `Publish` / `Unpublish` button.
+- Publish creates both:
+  - a tunnel ingress hostname route to the instance port (`https://<service-host>:<hostPort>`)
+  - a DNS `CNAME` in your zone pointing to `<tunnel-id>.cfargotunnel.com`
+- Tunnel ingress rule sets `originRequest.noTLSVerify=true` by default (configurable via env).
+- Delete automatically attempts to remove Cloudflare route + DNS when an instance was published.
+- Hostnames are restricted to the configured `CLOUDFLARE_BASE_DOMAIN`.
+
+### Required token permissions
+
+If using `CLOUDFLARE_API_TOKEN`, the token should include permissions for:
+
+- Account tunnel configuration edit (for ingress route updates)
+- Zone DNS edit (for CNAME create/delete)
+
+### Password sharing helper
+
+Instance cards now include `Copy Password` to quickly copy the VNC password when sharing a published Cloudflare FQDN.
 
 ## API
 
