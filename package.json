@@ -1,0 +1,9 @@
+{
+  "name": "kasm-desktop-manager",
+  "version": "4.0.0",
+  "description": "Zero-dependency Node manager for Kasm Desktop containers with built-in path proxy and launch helper.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

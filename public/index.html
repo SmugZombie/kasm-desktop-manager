@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kasm Manager</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+
+  <div id="loginOverlay" class="overlay hidden">
+    <div class="login-box">
+      <div class="login-header">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <h1>Kasm Manager</h1>
+      </div>
+      <form id="loginForm" autocomplete="on">
+        <div class="field">
+          <label for="loginUsername">Username</label>
+          <input id="loginUsername" name="username" type="text" autocomplete="username" placeholder="admin" />
+        </div>
+        <div class="field">
+          <label for="loginPassword">Password</label>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" placeholder="••••••••" />
+        </div>
+        <button type="submit" class="btn btn-primary btn-block">Sign in</button>
+      </form>
+      <div id="loginMessage" class="alert hidden"></div>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <nav class="navbar">
+      <div class="navbar-brand">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        Kasm Manager
+      </div>
+      <div class="navbar-end">
+        <button id="newDesktopBtn" class="btn btn-primary btn-sm">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          New Desktop
+        </button>
+        <button id="logoutBtn" class="btn btn-ghost btn-sm">Sign out</button>
+      </div>
+    </nav>
+
+    <div id="createPanel" class="create-panel hidden">
+      <div class="container">
+        <div class="panel-header">
+          <h2>New Desktop</h2>
+          <button id="closePanelBtn" class="btn btn-ghost btn-sm">✕ Close</button>
+        </div>
+        <form id="createForm">
+          <div class="form-grid">
+            <div class="field">
+              <label>Name</label>
+              <input name="name" required placeholder="my-desktop" />
+            </div>
+            <div class="field">
+              <label>Preset</label>
+              <select id="presetName" name="presetName">
+                <option value="">Custom image</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Image</label>
+              <select id="imageSelect">
+                <option value="">Loading images…</option>
+              </select>
+            </div>
+            <div class="field hidden" id="tagField">
+              <label>Tag / Version</label>
+              <select id="tagSelect">
+                <option value="">Loading tags…</option>
+              </select>
+            </div>
+            <div class="field hidden" id="customImageField">
+              <label>Custom Image</label>
+              <input id="customImageInput" placeholder="kasmweb/core-ubuntu-jammy:1.16.0" />
+            </div>
+            <div class="field">
+              <label>VNC Password</label>
+              <div class="input-row">
+                <input id="vncPassword" name="password" type="password" required autocomplete="off" />
+                <button type="button" id="togglePassword" class="btn btn-outline btn-sm" title="Show/hide password">👁</button>
+                <button type="button" id="regenPassword" class="btn btn-outline btn-sm" title="Generate new password">↻</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>Host Port <span class="label-hint" id="portRangeHint">auto-assigned</span></label>
+              <input id="hostPortInput" name="hostPort" type="number" min="1" max="65535" placeholder="auto" />
+            </div>
+            <div class="field">
+              <label>Internal Port</label>
+              <input name="internalPort" placeholder="6901/tcp" />
+            </div>
+            <div class="field">
+              <label>Network Mode</label>
+              <input name="networkMode" placeholder="bridge" />
+            </div>
+            <div class="field">
+              <label>Profile Mount Path</label>
+              <input name="profileMountPath" placeholder="/home/kasm-user" />
+            </div>
+            <div class="field field-full">
+              <label>Extra Env <span class="label-hint">KEY=VALUE, one per line</span></label>
+              <textarea name="extraEnv" rows="3"></textarea>
+            </div>
+            <div class="field field-full">
+              <label>Volume Binds <span class="label-hint">/host:/container, one per line</span></label>
+              <textarea name="binds" rows="3"></textarea>
+            </div>
+          </div>
+          <div class="form-footer">
+            <label class="checkbox-label">
+              <input name="persistentProfile" type="checkbox" />
+              <span>Persistent profile volume</span>
+            </label>
+            <div class="form-actions">
+              <div id="createMessage" class="alert hidden"></div>
+              <button type="submit" class="btn btn-primary">Create Desktop</button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <main class="container main">
+      <div class="section-header">
+        <h2>Desktops <span id="instanceCountBadge" class="instance-count-badge hidden"></span></h2>
+        <button id="refreshBtn" class="btn btn-ghost btn-sm">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+          Refresh
+        </button>
+      </div>
+      <div id="message" class="alert hidden"></div>
+      <div id="instances"></div>
+
+      <div class="stats-card" id="statsCard">
+        <div class="stats-header">
+          <span class="stats-title">Host Resources</span>
+          <span id="statsAge" class="stats-age"></span>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-item">
+            <div class="stat-label">CPU</div>
+            <div class="stat-bar"><div id="cpuFill" class="stat-fill"></div></div>
+            <div id="cpuVal" class="stat-val">—</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-label">RAM</div>
+            <div class="stat-bar"><div id="ramFill" class="stat-fill"></div></div>
+            <div id="ramVal" class="stat-val">—</div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-label">Disk</div>
+            <div class="stat-bar"><div id="diskFill" class="stat-fill"></div></div>
+            <div id="diskVal" class="stat-val">—</div>
+          </div>
+        </div>
+      </div>
+      <div class="stats-card" id="localImagesCard" style="margin-top:10px">
+        <div class="stats-header">
+          <span class="stats-title">Local Kasm Images</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="localImagesCount" class="stats-age"></span>
+            <button id="deleteAllImagesBtn" class="btn btn-danger btn-sm hidden">Delete All</button>
+          </div>
+        </div>
+        <div id="localImagesList" class="local-images-list">
+          <span class="stats-age">Loading…</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

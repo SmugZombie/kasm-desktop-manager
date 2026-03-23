@@ -1,0 +1,32 @@
+services:
+  kasm-manager:
+    build: .
+    container_name: kasm-manager
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ENABLE_REVERSE_PROXY_AUTH: ${ENABLE_REVERSE_PROXY_AUTH:-false}
+      REVERSE_PROXY_USER_HEADER: ${REVERSE_PROXY_USER_HEADER:-x-forwarded-user}
+      REVERSE_PROXY_REQUIRED_VALUE: ${REVERSE_PROXY_REQUIRED_VALUE:-}
+      PASSWORD_ENV_KEY: ${PASSWORD_ENV_KEY:-VNC_PW}
+      DEFAULT_INTERNAL_PORT: ${DEFAULT_INTERNAL_PORT:-6901/tcp}
+      DEFAULT_NETWORK_MODE: ${DEFAULT_NETWORK_MODE:-bridge}
+      DEFAULT_PROFILE_MOUNT_PATH: ${DEFAULT_PROFILE_MOUNT_PATH:-/home/kasm-user}
+      INSTANCE_NAME_PREFIX: ${INSTANCE_NAME_PREFIX:-kasm-desktop-}
+      PROFILE_VOLUME_PREFIX: ${PROFILE_VOLUME_PREFIX:-kasm-profile-}
+      MANAGED_LABEL: ${MANAGED_LABEL:-com.egli.kasm-manager.managed}
+      PORT_RANGE_START: ${PORT_RANGE_START:-6901}
+      PORT_RANGE_END: ${PORT_RANGE_END:-6999}
+      MAX_INSTANCES: ${MAX_INSTANCES:-10}
+      IMAGE_PRESETS_FILE: /app/data/image-presets.json
+      DATA_FILE: /app/data/instances.json
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+      - /proc:/host/proc:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

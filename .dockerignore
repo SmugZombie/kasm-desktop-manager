@@ -1,0 +1,5 @@
+data/instances.json
+*.log
+.git
+.gitignore
+node_modules
