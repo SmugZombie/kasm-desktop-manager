@@ -4,6 +4,10 @@
   "description": "Zero-dependency Node manager for Kasm Desktop containers with built-in path proxy and launch helper.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }

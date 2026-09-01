@@ -3,6 +3,8 @@ const loginOverlay   = document.getElementById('loginOverlay');
 const githubLoginBtn = document.getElementById('githubLoginBtn');
 const loginMessage   = document.getElementById('loginMessage');
 const appEl          = document.getElementById('app');
+let pollTimer = null;
+let statsTimer = null;
 const logoutBtn      = document.getElementById('logoutBtn');
 const currentUserEl  = document.getElementById('currentUser');
 const newDesktopBtn  = document.getElementById('newDesktopBtn');
@@ -25,6 +27,15 @@ const refreshBtn     = document.getElementById('refreshBtn');
 const instancesEl    = document.getElementById('instances');
 const messageEl      = document.getElementById('message');
 
+// ── Escaping ──────────────────────────────────────────────
+// Instance names, image refs and Docker error output all reach the DOM; none of
+// them are ours to trust.
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[ch]);
+}
+
 // ── Alerts ────────────────────────────────────────────────
 function showAlert(el, text, type = 'error') {
   el.textContent = text;
@@ -41,6 +52,10 @@ async function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
   const res = await fetch(path, { ...options, headers });
   if (res.status === 401) { showLogin(); throw new Error('Session expired — please sign in again.'); }
+  if (res.status === 403) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.error || 'Not permitted.');
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
   return data;
@@ -58,8 +73,16 @@ function parseLines(text, mode = 'string') {
 
 // ── Auth ──────────────────────────────────────────────────
 function showLogin() {
+  // Stop every timer first, or an expired session produces a 401 every few
+  // seconds for as long as the tab stays open.
+  stopPolling();
   loginOverlay.classList.remove('hidden');
   appEl.classList.add('hidden');
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
 }
 
 function hideLogin() {
@@ -80,7 +103,7 @@ async function showCurrentUser() {
   try {
     const { user } = await api('/api/me');
     if (!user) { currentUserEl.classList.add('hidden'); return; }
-    currentUserEl.textContent = `@${user.login}`;
+    currentUserEl.textContent = user.isAdmin ? `@${user.login} · admin` : `@${user.login}`;
     currentUserEl.title = user.email ? `${user.name} · ${user.email}` : user.name;
     currentUserEl.classList.remove('hidden');
   } catch {
@@ -149,6 +172,10 @@ createForm.addEventListener('submit', async (e) => {
     binds: parseLines(form.get('binds'), 'string'),
     persistentProfile: form.get('persistentProfile') === 'on',
     profileMountPath: form.get('profileMountPath') || undefined,
+    cpuLimit: form.get('cpuLimit') || undefined,
+    memoryLimit: form.get('memoryLimit') || undefined,
+    shmSize: form.get('shmSize') || undefined,
+    pidsLimit: form.get('pidsLimit') || undefined,
   };
   try {
     await api('/api/instances', { method: 'POST', body: JSON.stringify(payload) });
@@ -163,7 +190,6 @@ createForm.addEventListener('submit', async (e) => {
 
 // ── Instances ─────────────────────────────────────────────
 const TRANSIENT_STATES = new Set(['pulling', 'creating']);
-let pollTimer = null;
 
 function stateClass(state = '') {
   const s = state.toLowerCase();
@@ -207,11 +233,17 @@ function instanceCard(inst) {
   const card = document.createElement('div');
   card.className = `instance-card${isPending ? ' is-pending' : ''}${isError ? ' is-error' : ''}`;
 
+  const directUrl = inst.desktopHostname
+    ? `${location.protocol}//${esc(inst.desktopHostname)}/`
+    : `${esc(inst.pathPrefix || '')}/`;
+  const directLabel = inst.desktopHostname ? esc(inst.desktopHostname) : `${esc(inst.pathPrefix || '')}/`;
+
   const actionsHtml = isPending ? '' : `
     <button class="btn btn-primary btn-sm" data-action="launch">Launch</button>
-    <button class="btn btn-outline btn-sm" data-action="open-route">Open /${inst.hostPort}/</button>
+    <button class="btn btn-outline btn-sm" data-action="open-route">Open</button>
     <button class="btn btn-outline btn-sm" data-action="start">Start</button>
     <button class="btn btn-outline btn-sm" data-action="stop">Stop</button>
+    <button class="btn btn-outline btn-sm" data-action="logs">Logs</button>
     <button class="btn btn-outline btn-sm" data-action="reset">Reset</button>
     <button class="btn btn-danger btn-sm" data-action="delete">Delete</button>
   `;
@@ -219,22 +251,24 @@ function instanceCard(inst) {
   card.innerHTML = `
     <div class="instance-top">
       <span class="status-dot ${stateClass(inst.state)}"></span>
-      <span class="instance-name">${inst.name}</span>
-      <span class="instance-state">${stateLabel(inst.state)}</span>
+      <span class="instance-name">${esc(inst.name)}</span>
+      <span class="instance-state">${esc(stateLabel(inst.state))}</span>
       <div class="instance-actions">${actionsHtml}</div>
     </div>
-    ${isError && inst.error ? `<div class="instance-error">Error: ${inst.error}</div>` : ''}
+    ${isError && inst.error ? `<div class="instance-error">Error: ${esc(inst.error)}</div>` : ''}
     <div class="instance-meta">
-      <span class="meta-tag">${inst.image}</span>
+      <span class="meta-tag">${esc(inst.image)}</span>
       <span class="meta-sep">·</span>
-      <span class="meta-tag">Port <strong>${inst.hostPort}</strong></span>
+      <span class="meta-tag">Port <strong>${esc(inst.hostPort)}</strong></span>
       ${!isPending ? `
       <span class="meta-sep">·</span>
-      <span class="meta-tag">Proxy <a href="${inst.pathPrefix}/" target="_blank" rel="noopener">${inst.pathPrefix}/</a></span>
+      <span class="meta-tag">At <a href="${directUrl}" target="_blank" rel="noopener">${directLabel}</a></span>
       ` : ''}
+      ${inst.ownerLogin ? `<span class="meta-sep">·</span><span class="meta-tag">👤 ${esc(inst.ownerLogin)}</span>` : ''}
       ${inst.persistentProfile ? `<span class="meta-sep">·</span><span class="meta-tag">📁 Profile</span>` : ''}
-      ${inst.containerId ? `<span class="meta-sep">·</span><span class="meta-tag" style="font-family:monospace;font-size:11px">${inst.containerId.slice(0,12)}</span>` : ''}
+      ${inst.containerId ? `<span class="meta-sep">·</span><span class="meta-tag" style="font-family:monospace;font-size:11px">${esc(inst.containerId.slice(0,12))}</span>` : ''}
     </div>
+    <div class="instance-logs hidden"><pre></pre></div>
   `;
 
   card.querySelectorAll('button[data-action]').forEach(btn => {
@@ -242,8 +276,14 @@ function instanceCard(inst) {
       const action = btn.dataset.action;
       hideAlert(messageEl);
       try {
-        if (action === 'launch') { window.open(`/launch/${inst.id}`, '_blank', 'noopener'); return; }
-        if (action === 'open-route') { window.open(`${inst.pathPrefix}/`, '_blank', 'noopener'); return; }
+        if (action === 'launch') {
+          // Mint a one-time launch token so the URL cannot be replayed later.
+          const { launchPath } = await api(`/api/instances/${inst.id}/launch`, { method: 'POST' });
+          window.open(launchPath, '_blank', 'noopener');
+          return;
+        }
+        if (action === 'open-route') { window.open(directUrl, '_blank', 'noopener'); return; }
+        if (action === 'logs') { await toggleLogs(card, inst); return; }
         if (action === 'start')  await api(`/api/instances/${inst.id}/start`, { method: 'POST' });
         if (action === 'stop')   await api(`/api/instances/${inst.id}/stop`, { method: 'POST' });
         if (action === 'reset')  await api(`/api/instances/${inst.id}/reset`, { method: 'POST', body: JSON.stringify({ clearProfile: false }) });
@@ -260,6 +300,25 @@ function instanceCard(inst) {
   });
 
   return card;
+}
+
+async function toggleLogs(card, inst) {
+  const panel = card.querySelector('.instance-logs');
+  const pre = panel.querySelector('pre');
+  if (!panel.classList.contains('hidden')) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+  pre.textContent = 'Loading…';
+  try {
+    const [{ logs }, statsResult] = await Promise.all([
+      api(`/api/instances/${inst.id}/logs?tail=200`),
+      api(`/api/instances/${inst.id}/stats`).catch(() => null),
+    ]);
+    const s = statsResult?.stats;
+    const header = s ? `CPU ${s.cpu} · MEM ${s.mem} (${s.memPerc}) · PIDs ${s.pids}\n${'─'.repeat(40)}\n` : '';
+    pre.textContent = header + (logs || '(no output)');
+  } catch (err) {
+    pre.textContent = err.message;
+  }
 }
 
 function renderInstances(instances) {
@@ -360,8 +419,6 @@ function setFill(id, pct) {
   el.style.width = pct + '%';
   el.className = 'stat-fill' + (pct >= 90 ? ' crit' : pct >= 70 ? ' warn' : '');
 }
-
-let statsTimer = null;
 
 async function loadStats() {
   try {
@@ -489,6 +546,11 @@ async function loadAll() {
     }
 
     updateInstanceCountBadge(cfg.instanceCount ?? 0, cfg.maxInstances ?? 10);
+
+    // Image management is destructive and host-wide, so it is admin-only.
+    document.getElementById('localImagesSection')?.classList.toggle('hidden', cfg.isAdmin === false);
+    // Bind mounts are refused by the server unless the operator enabled them.
+    document.getElementById('bindsField')?.classList.toggle('hidden', !cfg.allowCustomBinds);
 
     await Promise.all([loadPresets(), loadKasmImages(), loadInstances(), loadLocalImages()]);
     startStatsPolling();

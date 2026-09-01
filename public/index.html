@@ -101,7 +101,23 @@
               <label>Extra Env <span class="label-hint">KEY=VALUE, one per line</span></label>
               <textarea name="extraEnv" rows="3"></textarea>
             </div>
-            <div class="field field-full">
+            <div class="field">
+              <label>CPU Limit <span class="label-hint">cores, e.g. 2</span></label>
+              <input name="cpuLimit" placeholder="unlimited" />
+            </div>
+            <div class="field">
+              <label>Memory Limit <span class="label-hint">e.g. 4g</span></label>
+              <input name="memoryLimit" placeholder="unlimited" />
+            </div>
+            <div class="field">
+              <label>Shared Memory <span class="label-hint">/dev/shm, e.g. 2g</span></label>
+              <input name="shmSize" placeholder="2g" />
+            </div>
+            <div class="field">
+              <label>PID Limit</label>
+              <input name="pidsLimit" placeholder="unlimited" />
+            </div>
+            <div class="field field-full hidden" id="bindsField">
               <label>Volume Binds <span class="label-hint">/host:/container, one per line</span></label>
               <textarea name="binds" rows="3"></textarea>
             </div>
@@ -154,7 +170,7 @@
           </div>
         </div>
       </div>
-      <div class="stats-card" id="localImagesCard" style="margin-top:10px">
+      <div class="stats-card" id="localImagesSection" style="margin-top:10px">
         <div class="stats-header">
           <span class="stats-title">Local Kasm Images</span>
           <div style="display:flex;align-items:center;gap:10px">

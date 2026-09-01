@@ -1,27 +1,39 @@
-# Kasm Desktop Manager Starter v4
+# Kasm Desktop Manager
 
-This version adds a built-in path proxy and launch workflow so managed desktops can be opened through `/<port>/` and launched through `/launch/<instanceId>`.
+Zero-dependency Node manager for Kasm Desktop containers, with GitHub sign-in, a
+built-in proxy and a launch workflow.
 
-## What changed in v4
+## What it does
 
-- built-in reverse proxy for managed Kasm ports
-- managed path routing like `/6901/`
-- launch button in the UI
-- `/launch/:id` helper that redirects to a best-effort auto-connect URL
-- WebSocket proxy support for Kasm/noVNC traffic
-- response rewriting for:
-  - `Location` headers
-  - cookie `Path`
-  - common root-relative asset and websocket references in HTML/JS/CSS
-- still zero npm dependencies
+- creates, starts, stops, resets and deletes Kasm desktop containers
+- signs users in with GitHub and admits only accounts you list
+- serves each desktop either on its own hostname or through `/<port>/`
+- proxies HTTP and WebSocket traffic, including noVNC/websockify
+- shows host stats, per-container stats and container logs
+- keeps an audit trail of who did what
+- still ships with no npm dependencies
 
-## Important reality check
+## Two ways to serve desktops
 
-The `/<port>/` proxy mode is a **best-effort compatibility layer** for images that normally expect to live at `/`. It is useful when tools like Cloudflare Tunnel are publishing a subpath instead of a dedicated hostname.
+**Hostname mode (recommended).** Set `DESKTOP_HOSTNAME_TEMPLATE` and each desktop
+answers on its own hostname:
 
-For many Kasm/noVNC images, this works well enough to get through auth and into the desktop. But some images may still have frontend assumptions that are hardcoded to root paths. If that happens, a dedicated hostname per instance is still the most reliable option.
+```env
+DESKTOP_HOSTNAME_TEMPLATE=desktop-{port}.example.com
+SESSION_COOKIE_DOMAIN=.example.com
+```
 
-The direct launch flow uses a noVNC-style URL with `autoconnect=1`, `password=...`, and `path=<port>/websockify`. This is convenient, but it also means the password appears in the generated launch URL for that session. Use this only behind trusted access controls.
+Point a wildcard DNS record at the manager. Nothing about the response is
+rewritten, and every desktop lands on its own browser origin, so a compromised
+desktop image cannot reach the manager's API or the pages of other desktops.
+
+**Path mode (default).** Desktops are served under `/<hostPort>/` on the
+manager's own hostname. This is a best-effort compatibility layer: the manager
+rewrites `Location` headers, cookie paths and root-relative references in
+HTML/CSS/JS so images that expect to live at `/` mostly work. Useful behind a
+Cloudflare Tunnel publishing a single hostname, but some images have hardcoded
+root paths that no rewriting can fix — and because every desktop shares the
+manager's origin, treat the desktops as trusted code.
 
 ## Quick start
 
@@ -36,76 +48,78 @@ Open:
 
 - `http://YOUR-HOST:3000`
 
-## New launch behavior
+## Launching a desktop
 
-Each instance now has:
+Each desktop has:
 
-- a proxied route: `/<hostPort>/`
-- a launch route: `/launch/<instanceId>`
-- an API launch value: `GET /api/instances/:id/launch`
+- a direct route — `https://desktop-6901.example.com/` in hostname mode, or
+  `/<hostPort>/` in path mode
+- a launch route: `/launch/<instanceId>`, which redirects to a noVNC URL with
+  `autoconnect=1` and the connection details filled in
+- `POST /api/instances/:id/launch`, which mints a one-time launch token and
+  returns `/launch/<id>?t=<token>`
 
-Example:
+The Launch button uses the token route, so a copied URL stops working shortly
+after it is used. Anyone who reloads the tab still gets in on their session.
 
-- `http://manager-host:3000/6901/`
-- `http://manager-host:3000/launch/abc123def4`
+By default the launch URL carries the desktop password, which means it lands in
+that tab's address bar. Set `LAUNCH_INCLUDE_PASSWORD=false` to leave it out; the
+password is then read on demand from the manager, and the audit log records it.
 
-The manager redirects `/<port>/` to a launch URL like:
+## Reverse proxy / Cloudflare Tunnel
 
-```text
-/<port>/vnc.html?autoconnect=1&password=YOURPASSWORD&path=<port>/websockify&resize=remote&reconnect=1
-```
+**Hostname mode** — give the tunnel a wildcard and let each desktop have a host:
 
-## Reverse proxy / Cloudflare Tunnel idea
+- `https://kasm.example.com` -> the manager
+- `https://desktop-6901.example.com` -> desktop on local port 6901
 
-Point the tunnel at the manager app, not directly at the Kasm desktop:
+Set `SESSION_COOKIE_DOMAIN=.example.com` so the session reaches both.
 
-- `https://kasm.example.com/6901/` -> manager container -> desktop on local port 6901
-- `https://kasm.example.com/6902/` -> manager container -> desktop on local port 6902
+**Path mode** — point the tunnel at the manager only, and it handles the path
+stripping and rewriting:
 
-That lets the manager handle the path stripping and best-effort rewriting.
+- `https://kasm.example.com/6901/` -> manager -> desktop on local port 6901
+
+If TLS terminates at the proxy and `X-Forwarded-Proto` is not passed through,
+set `FORCE_SECURE_COOKIES=true` so session cookies keep the `Secure` flag.
 
 ## Environment variables
 
-```env
-GITHUB_CLIENT_ID=
-GITHUB_CLIENT_SECRET=
-GITHUB_CALLBACK_URL=
-GITHUB_ALLOWED_USERS=octocat,someone-else
-GITHUB_ALLOWED_EMAILS=you@example.com
-SESSION_TTL_HOURS=12
-ENABLE_REVERSE_PROXY_AUTH=false
-REVERSE_PROXY_USER_HEADER=x-forwarded-user
-REVERSE_PROXY_REQUIRED_VALUE=
-PASSWORD_ENV_KEY=VNC_PW
-DEFAULT_INTERNAL_PORT=6901/tcp
-DEFAULT_NETWORK_MODE=bridge
-DEFAULT_PROFILE_MOUNT_PATH=/home/kasm-user
-INSTANCE_NAME_PREFIX=kasm-desktop-
-PROFILE_VOLUME_PREFIX=kasm-profile-
-MANAGED_LABEL=com.egli.kasm-manager.managed
-PROXY_TEXT_REWRITE=true
-LAUNCH_AUTOCONNECT=true
-LAUNCH_RESIZE=remote
-LAUNCH_VIEW_ONLY=false
-```
+`.env.example` is the annotated reference; every variable there is forwarded by
+`docker-compose.yml`. The ones worth knowing about:
+
+| Variable | Purpose |
+| --- | --- |
+| `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | OAuth app credentials. Without them the manager runs unauthenticated. |
+| `GITHUB_ALLOWED_USERS` / `GITHUB_ALLOWED_EMAILS` | Who may sign in. |
+| `GITHUB_ALLOWED_ORG` / `GITHUB_ALLOWED_TEAM` | Admit a whole GitHub org or team instead of listing people. |
+| `GITHUB_ADMIN_USERS` | Who may see every desktop and delete images. Empty = everyone. |
+| `SESSION_SECRET` | Signs session cookies. Unset means a restart signs everyone out. |
+| `DESKTOP_HOSTNAME_TEMPLATE` | Serve each desktop on its own hostname instead of `/<port>/`. |
+| `ALLOW_CUSTOM_BINDS` / `ALLOWED_BIND_PREFIXES` | Bind mounts are refused unless you opt in. |
+| `DEFAULT_CPU_LIMIT` / `DEFAULT_MEMORY_LIMIT` / `DEFAULT_SHM_SIZE` / `DEFAULT_PIDS_LIMIT` | Per-desktop resource ceilings. |
+| `IDLE_TIMEOUT_MINUTES` | Stop desktops with no traffic for this long. `0` disables it. |
+| `LAUNCH_INCLUDE_PASSWORD` | Set `false` to keep the desktop password out of the launch URL. |
 
 ## API
 
-- `GET /auth/github/login`
-- `GET /auth/github/callback`
-- `GET /api/me`
-- `POST /api/logout`
-- `GET /api/health`
-- `GET /api/config`
-- `GET /api/presets`
-- `GET /api/ports`
+Everything under `/api` requires a session; mutating calls must also come from
+the manager's own origin.
+
+- `GET /auth/github/login` · `GET /auth/github/callback`
+- `GET /api/me` · `POST /api/logout`
+- `GET /api/health` · `GET /api/config` · `GET /api/stats`
+- `GET /api/presets` · `GET /api/ports`
 - `GET /api/instances`
-- `GET /api/instances/:id/launch`
 - `POST /api/instances`
-- `POST /api/instances/:id/start`
-- `POST /api/instances/:id/stop`
-- `POST /api/instances/:id/reset`
+- `POST /api/instances/:id/launch` — mints a one-time launch token
+- `GET /api/instances/:id/logs?tail=200`
+- `GET /api/instances/:id/stats`
+- `GET /api/instances/:id/password` — audited
+- `POST /api/instances/:id/start` · `stop` · `reset`
 - `DELETE /api/instances/:id`
+- `GET /api/audit` — admins only
+- `GET|DELETE /api/local-images` — deletion is admin-only
 
 ## Authentication
 
@@ -120,36 +134,81 @@ Sign-in goes through **GitHub OAuth**. There is no local username/password login
 
 Copy the Client ID, generate a Client Secret, and put both in `.env`.
 
-### 2. List who is allowed in
+### 2. Say who is allowed in
 
-Authenticating with GitHub is not enough — the account must also appear in the allow list:
+Authenticating with GitHub is not enough — the account must also be permitted,
+by name or by org membership:
 
 ```env
 GITHUB_ALLOWED_USERS=octocat,my-teammate
 GITHUB_ALLOWED_EMAILS=you@example.com
+GITHUB_ALLOWED_ORG=my-org
+GITHUB_ALLOWED_TEAM=desktops
 ```
 
-- Both variables accept comma- or whitespace-separated values and are case-insensitive.
-- `GITHUB_ALLOWED_USERS` matches the GitHub login (username). Any entry containing `@` is treated as an email instead, so a single variable can hold both kinds.
-- `GITHUB_ALLOWED_EMAILS` matches the account's **verified** GitHub email addresses (the app requests the `read:user` and `user:email` scopes).
+- All list variables accept comma- or whitespace-separated values and are case-insensitive.
+- `GITHUB_ALLOWED_USERS` matches the GitHub login. Any entry containing `@` is treated as an email instead, so one variable can hold both kinds.
+- `GITHUB_ALLOWED_EMAILS` matches the account's **verified** GitHub emails. An unverified address never grants access.
+- `GITHUB_ALLOWED_ORG` admits any active member of that org; add `GITHUB_ALLOWED_TEAM` to narrow it to one team. This requests the `read:org` scope, and a pending invitation does not count as membership.
 
-If both lists are empty, nobody can sign in and the app logs a warning at startup.
+If every one of these is empty, nobody can sign in and the app warns at startup.
+
+### 3. Decide who is an admin
+
+```env
+GITHUB_ADMIN_USERS=you
+```
+
+Admins see and control every desktop, may delete images, and can read the audit
+log. Everyone else sees only the desktops they created — someone else's desktop
+answers `404`, whether through the API, the proxy or a launch URL.
+
+Leaving `GITHUB_ADMIN_USERS` empty makes every permitted user an admin, which
+keeps a single-operator setup working exactly as before.
 
 ### How it works
 
-- `GET /auth/github/login` redirects to GitHub with a random `state` stored in a short-lived `HttpOnly` cookie.
-- `GET /auth/github/callback` verifies `state`, exchanges the code for an access token, reads the profile plus verified emails, checks the allow list, and issues an `HttpOnly` session cookie.
-- Sessions are held in memory, so a restart signs everyone out. They expire after `SESSION_TTL_HOURS` (default 12).
-- The API, the `/<port>/` proxy, the WebSocket upgrade, and `/launch/<id>` all require a valid session.
-- `ENABLE_REVERSE_PROXY_AUTH=true` still lets an upstream gateway (Cloudflare Access etc.) authorize requests via a header instead.
+- `GET /auth/github/login` redirects to GitHub with a random `state` held in a short-lived `HttpOnly` cookie.
+- `GET /auth/github/callback` verifies `state` with a timing-safe compare, exchanges the code for a token, reads the profile plus verified emails, checks the allow list and org, then issues the session cookie.
+- Sessions are **signed cookies** (HMAC-SHA256 over the identity and an expiry), so a restart no longer signs everyone out — as long as `SESSION_SECRET` is set. Logout revokes the token server-side until it would have expired anyway.
+- The API, both proxy modes, the WebSocket upgrade and `/launch/<id>` all require a valid session.
+- `ENABLE_REVERSE_PROXY_AUTH=true` lets an upstream gateway authorize instead, but only when `REVERSE_PROXY_REQUIRED_VALUE` or `REVERSE_PROXY_SHARED_SECRET` is set — an unauthenticated header would otherwise be forgeable by anyone who can reach the port.
 
 If `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` are unset and reverse-proxy auth is off, the manager runs with **no authentication** and warns on startup. Do not expose it in that state.
 
 ## Security notes
 
-This manager:
-- mounts the Docker socket
-- stores instance passwords in its local instance registry
-- can place launch passwords in the browser URL for auto-connect
+This manager mounts the Docker socket, so anyone who can create a desktop can
+run a container on your host. The controls that matter:
 
-Configure GitHub auth (above) before exposing it. Fronting it with Cloudflare Access or another auth gateway as well is still recommended.
+- **Bind mounts are refused by default.** `ALLOW_CUSTOM_BINDS=false` and an empty
+  `ALLOWED_BIND_PREFIXES` mean a request cannot mount host paths into a desktop.
+  Set `ALLOWED_BIND_PREFIXES=/srv/desktops` to permit a specific subtree.
+- **Network modes are restricted** to `bridge,none` by default; `host` and
+  `container:` are refused.
+- **Desktop passwords never appear in API responses.** They are revealed only by
+  `GET /api/instances/:id/password`, which is audited. Set
+  `LAUNCH_INCLUDE_PASSWORD=false` to keep them out of launch URLs too, at the
+  cost of typing the password into the noVNC prompt.
+- **The manager's session cookie is stripped** from every request forwarded to a
+  desktop container, so a malicious image cannot read it off the wire.
+- **Mutating API calls are origin-checked**, so a desktop page cannot drive the
+  API with the viewer's session.
+- **Non-admins see only their own desktops.** Set `GITHUB_ADMIN_USERS` to make
+  that distinction real; leaving it empty makes everyone an admin.
+- **Every mutating action is written to `data/audit.log`** with the GitHub login
+  that performed it, readable by admins at `GET /api/audit`.
+
+Still recommended: run it behind TLS, and put Cloudflare Access or another
+gateway in front if you want a second layer.
+
+## Development
+
+```bash
+npm test        # node:test, no dependencies, no Docker required
+npm start
+```
+
+The test suite stubs GitHub and the upstream desktop, and covers the OAuth flow,
+the allow list, session signing, cookie stripping, proxy response framing,
+ownership and the container policy checks.
