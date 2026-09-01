@@ -1,5 +1,10 @@
-data/instances.json
+.env
+.env.*
+!.env.example
+data/
 *.log
 .git
 .gitignore
+.github
 node_modules
+test/
