@@ -27,7 +27,8 @@ The direct launch flow uses a noVNC-style URL with `autoconnect=1`, `password=..
 
 ```bash
 cp .env.example .env
-# edit ADMIN_TOKEN
+# create a GitHub OAuth App, then fill in GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET
+# and list who may sign in via GITHUB_ALLOWED_USERS / GITHUB_ALLOWED_EMAILS
 docker compose up -d --build
 ```
 
@@ -66,7 +67,12 @@ That lets the manager handle the path stripping and best-effort rewriting.
 ## Environment variables
 
 ```env
-ADMIN_TOKEN=change-this-now
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+GITHUB_CALLBACK_URL=
+GITHUB_ALLOWED_USERS=octocat,someone-else
+GITHUB_ALLOWED_EMAILS=you@example.com
+SESSION_TTL_HOURS=12
 ENABLE_REVERSE_PROXY_AUTH=false
 REVERSE_PROXY_USER_HEADER=x-forwarded-user
 REVERSE_PROXY_REQUIRED_VALUE=
@@ -85,6 +91,10 @@ LAUNCH_VIEW_ONLY=false
 
 ## API
 
+- `GET /auth/github/login`
+- `GET /auth/github/callback`
+- `GET /api/me`
+- `POST /api/logout`
 - `GET /api/health`
 - `GET /api/config`
 - `GET /api/presets`
@@ -97,6 +107,44 @@ LAUNCH_VIEW_ONLY=false
 - `POST /api/instances/:id/reset`
 - `DELETE /api/instances/:id`
 
+## Authentication
+
+Sign-in goes through **GitHub OAuth**. There is no local username/password login.
+
+### 1. Create a GitHub OAuth App
+
+<https://github.com/settings/developers> -> **New OAuth App**
+
+- **Homepage URL**: the manager's public URL, e.g. `https://kasm.example.com`
+- **Authorization callback URL**: that URL plus `/auth/github/callback`, e.g. `https://kasm.example.com/auth/github/callback`
+
+Copy the Client ID, generate a Client Secret, and put both in `.env`.
+
+### 2. List who is allowed in
+
+Authenticating with GitHub is not enough — the account must also appear in the allow list:
+
+```env
+GITHUB_ALLOWED_USERS=octocat,my-teammate
+GITHUB_ALLOWED_EMAILS=you@example.com
+```
+
+- Both variables accept comma- or whitespace-separated values and are case-insensitive.
+- `GITHUB_ALLOWED_USERS` matches the GitHub login (username). Any entry containing `@` is treated as an email instead, so a single variable can hold both kinds.
+- `GITHUB_ALLOWED_EMAILS` matches the account's **verified** GitHub email addresses (the app requests the `read:user` and `user:email` scopes).
+
+If both lists are empty, nobody can sign in and the app logs a warning at startup.
+
+### How it works
+
+- `GET /auth/github/login` redirects to GitHub with a random `state` stored in a short-lived `HttpOnly` cookie.
+- `GET /auth/github/callback` verifies `state`, exchanges the code for an access token, reads the profile plus verified emails, checks the allow list, and issues an `HttpOnly` session cookie.
+- Sessions are held in memory, so a restart signs everyone out. They expire after `SESSION_TTL_HOURS` (default 12).
+- The API, the `/<port>/` proxy, the WebSocket upgrade, and `/launch/<id>` all require a valid session.
+- `ENABLE_REVERSE_PROXY_AUTH=true` still lets an upstream gateway (Cloudflare Access etc.) authorize requests via a header instead.
+
+If `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` are unset and reverse-proxy auth is off, the manager runs with **no authentication** and warns on startup. Do not expose it in that state.
+
 ## Security notes
 
 This manager:
@@ -104,4 +152,4 @@ This manager:
 - stores instance passwords in its local instance registry
 - can place launch passwords in the browser URL for auto-connect
 
-Put it behind trusted auth. Cloudflare Access or another auth gateway is strongly recommended.
+Configure GitHub auth (above) before exposing it. Fronting it with Cloudflare Access or another auth gateway as well is still recommended.

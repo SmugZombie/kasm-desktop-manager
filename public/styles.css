@@ -64,6 +64,17 @@ body {
 
 .login-box form { display: flex; flex-direction: column; gap: 12px; }
 
+.login-hint { font-size: 13px; color: var(--text-muted); line-height: 1.5; }
+
+.btn-github { gap: 8px; }
+.btn-github svg { flex-shrink: 0; }
+
+.current-user {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
 /* ── Navbar ──────────────────────────────────────────── */
 .navbar {
   display: flex;
