@@ -14,8 +14,13 @@ const rootDir = __dirname;
 loadDotEnv(path.join(rootDir, '.env'));
 
 const PORT = Number(process.env.PORT || 3000);
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
+const GITHUB_CALLBACK_URL = process.env.GITHUB_CALLBACK_URL || '';
+const GITHUB_ALLOWED_USERS = parseAllowList(process.env.GITHUB_ALLOWED_USERS);
+const GITHUB_ALLOWED_EMAILS = parseAllowList(process.env.GITHUB_ALLOWED_EMAILS);
+const SESSION_TTL_HOURS = Number(process.env.SESSION_TTL_HOURS || 12);
+const GITHUB_AUTH_ENABLED = Boolean(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET);
 const ENABLE_REVERSE_PROXY_AUTH = String(process.env.ENABLE_REVERSE_PROXY_AUTH || 'false').toLowerCase() === 'true';
 const REVERSE_PROXY_USER_HEADER = (process.env.REVERSE_PROXY_USER_HEADER || 'x-forwarded-user').toLowerCase();
 const REVERSE_PROXY_REQUIRED_VALUE = process.env.REVERSE_PROXY_REQUIRED_VALUE || '';
@@ -41,6 +46,19 @@ const LAUNCH_RESIZE = process.env.LAUNCH_RESIZE || 'remote';
 const LAUNCH_VIEW_ONLY = String(process.env.LAUNCH_VIEW_ONLY || 'false').toLowerCase() === 'true';
 
 ensureStore();
+
+if (!GITHUB_AUTH_ENABLED && !ENABLE_REVERSE_PROXY_AUTH) {
+  console.warn('[auth] WARNING: GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET are not set — the manager is running with authentication DISABLED.');
+} else if (GITHUB_AUTH_ENABLED && !GITHUB_ALLOWED_USERS.length && !GITHUB_ALLOWED_EMAILS.length) {
+  console.warn('[auth] WARNING: GitHub auth is enabled but GITHUB_ALLOWED_USERS/GITHUB_ALLOWED_EMAILS are empty — nobody will be able to sign in.');
+}
+
+function parseAllowList(value) {
+  return String(value || '')
+    .split(/[,\s]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
 
 function loadDotEnv(file) {
   if (!fs.existsSync(file)) return;
@@ -332,11 +350,22 @@ function presentInstance(instance, inspect = null) {
 }
 
 const sessions = new Map();
+const SESSION_TTL_MS = Math.max(1, SESSION_TTL_HOURS) * 60 * 60 * 1000;
 
-function createSession() {
+function createSession(user) {
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { createdAt: Date.now() });
+  sessions.set(token, { createdAt: Date.now(), user });
   return token;
+}
+
+function getSession(token) {
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (Date.now() - session.createdAt > SESSION_TTL_MS) {
+    sessions.delete(token);
+    return null;
+  }
+  return session;
 }
 
 function destroySession(token) {
@@ -350,7 +379,13 @@ function isSecureRequest(req) {
 function makeSessionCookie(req, value, expire = false) {
   const secure = isSecureRequest(req) ? '; Secure' : '';
   if (expire) return `kasm_session=; HttpOnly; SameSite=Lax; Path=/${secure}; Max-Age=0`;
-  return `kasm_session=${value}; HttpOnly; SameSite=Lax; Path=/${secure}`;
+  return `kasm_session=${value}; HttpOnly; SameSite=Lax; Path=/${secure}; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`;
+}
+
+function makeStateCookie(req, value, expire = false) {
+  const secure = isSecureRequest(req) ? '; Secure' : '';
+  if (expire) return `kasm_oauth_state=; HttpOnly; SameSite=Lax; Path=/${secure}; Max-Age=0`;
+  return `kasm_oauth_state=${value}; HttpOnly; SameSite=Lax; Path=/${secure}; Max-Age=600`;
 }
 
 function parseCookies(req) {
@@ -372,11 +407,30 @@ function reverseProxyAuthorized(req) {
   return headerValue === REVERSE_PROXY_REQUIRED_VALUE;
 }
 
+function currentSession(req) {
+  const cookies = parseCookies(req);
+  const token = cookies['kasm_session'];
+  if (!token) return null;
+  return getSession(token);
+}
+
 function isAuthorized(req) {
   if (reverseProxyAuthorized(req)) return true;
-  if (!ADMIN_PASSWORD) return true;
-  const cookies = parseCookies(req);
-  return cookies['kasm_session'] && sessions.has(cookies['kasm_session']);
+  if (!GITHUB_AUTH_ENABLED) return true;
+  return Boolean(currentSession(req));
+}
+
+function isAllowedGitHubIdentity(login, emails) {
+  const normalizedLogin = String(login || '').toLowerCase();
+  const normalizedEmails = emails.map((email) => String(email || '').toLowerCase()).filter(Boolean);
+
+  // Entries containing "@" are matched against verified emails wherever they are listed,
+  // so a single GITHUB_ALLOWED_USERS list can hold both logins and email addresses.
+  const allowedLogins = GITHUB_ALLOWED_USERS.filter((entry) => !entry.includes('@'));
+  const allowedEmails = [...GITHUB_ALLOWED_EMAILS, ...GITHUB_ALLOWED_USERS.filter((entry) => entry.includes('@'))];
+
+  if (normalizedLogin && allowedLogins.includes(normalizedLogin)) return true;
+  return normalizedEmails.some((email) => allowedEmails.includes(email));
 }
 
 function sendJson(res, status, payload, extraHeaders = {}) {
@@ -403,8 +457,8 @@ function sendText(res, status, text, contentType = 'text/plain; charset=utf-8', 
   sendBuffer(res, status, body, contentType, extraHeaders);
 }
 
-function redirect(res, location, status = 302) {
-  res.writeHead(status, { Location: location });
+function redirect(res, location, status = 302, extraHeaders = {}) {
+  res.writeHead(status, { Location: location, ...extraHeaders });
   res.end();
 }
 
@@ -698,19 +752,138 @@ async function hydrateInstances() {
   }));
 }
 
+function requestOrigin(req) {
+  const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || (isSecureRequest(req) ? 'https' : 'http');
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`).split(',')[0].trim();
+  return `${proto}://${host}`;
+}
+
+function callbackUrl(req) {
+  return GITHUB_CALLBACK_URL || `${requestOrigin(req)}/auth/github/callback`;
+}
+
+async function githubPostJson(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'kasm-desktop-manager',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`GitHub responded with ${res.status}`);
+  return res.json();
+}
+
+async function githubGetJson(url, accessToken) {
+  const res = await fetch(url, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${accessToken}`,
+      'User-Agent': 'kasm-desktop-manager',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+  if (!res.ok) throw new Error(`GitHub responded with ${res.status}`);
+  return res.json();
+}
+
+function denyLogin(res, req, message) {
+  return redirect(res, `/?auth_error=${encodeURIComponent(message)}`, 302, { 'Set-Cookie': makeStateCookie(req, '', true) });
+}
+
+async function handleAuth(req, res, url) {
+  if (url.pathname === '/auth/github/login') {
+    if (!GITHUB_AUTH_ENABLED) return sendText(res, 503, 'GitHub authentication is not configured.');
+    const state = crypto.randomBytes(16).toString('hex');
+    const params = new URLSearchParams({
+      client_id: GITHUB_CLIENT_ID,
+      redirect_uri: callbackUrl(req),
+      scope: 'read:user user:email',
+      state,
+      allow_signup: 'false',
+    });
+    return redirect(res, `https://github.com/login/oauth/authorize?${params.toString()}`, 302, {
+      'Set-Cookie': makeStateCookie(req, state),
+    });
+  }
+
+  if (url.pathname === '/auth/github/callback') {
+    if (!GITHUB_AUTH_ENABLED) return sendText(res, 503, 'GitHub authentication is not configured.');
+
+    const cookies = parseCookies(req);
+    const expectedState = cookies['kasm_oauth_state'] || '';
+    const state = url.searchParams.get('state') || '';
+    if (!expectedState || !state || expectedState.length !== state.length ||
+        !crypto.timingSafeEqual(Buffer.from(expectedState), Buffer.from(state))) {
+      return denyLogin(res, req, 'Login session expired or invalid. Please try again.');
+    }
+
+    if (url.searchParams.get('error')) {
+      return denyLogin(res, req, url.searchParams.get('error_description') || 'GitHub authorization was denied.');
+    }
+
+    const code = url.searchParams.get('code');
+    if (!code) return denyLogin(res, req, 'GitHub did not return an authorization code.');
+
+    try {
+      const tokenResponse = await githubPostJson('https://github.com/login/oauth/access_token', {
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: callbackUrl(req),
+      });
+      const accessToken = tokenResponse.access_token;
+      if (!accessToken) {
+        return denyLogin(res, req, tokenResponse.error_description || 'Could not obtain a GitHub access token.');
+      }
+
+      const profile = await githubGetJson('https://api.github.com/user', accessToken);
+      let emails = [];
+      try {
+        const emailList = await githubGetJson('https://api.github.com/user/emails', accessToken);
+        emails = (Array.isArray(emailList) ? emailList : [])
+          .filter((entry) => entry && entry.verified)
+          .map((entry) => entry.email);
+      } catch {
+        // user:email scope may be unavailable — fall back to the public profile email
+        if (profile.email) emails = [profile.email];
+      }
+
+      if (!isAllowedGitHubIdentity(profile.login, emails)) {
+        console.warn(`[auth] denied GitHub login for "${profile.login}" (not in the allow list)`);
+        return denyLogin(res, req, `GitHub account "${profile.login}" is not authorized for this manager.`);
+      }
+
+      const sessionToken = createSession({
+        login: profile.login,
+        name: profile.name || profile.login,
+        email: emails[0] || profile.email || null,
+        avatarUrl: profile.avatar_url || null,
+      });
+      console.log(`[auth] GitHub login for "${profile.login}"`);
+      return redirect(res, '/', 302, {
+        'Set-Cookie': [makeSessionCookie(req, sessionToken), makeStateCookie(req, '', true)],
+      });
+    } catch (error) {
+      console.error('[auth] GitHub login failed:', error.message);
+      return denyLogin(res, req, 'GitHub login failed. Please try again.');
+    }
+  }
+
+  return false;
+}
+
 async function handleApi(req, res, url) {
-  if (!isAuthorized(req) && !['/api/config', '/api/login'].includes(url.pathname)) {
+  if (!isAuthorized(req) && !['/api/config'].includes(url.pathname)) {
     return sendJson(res, 401, { error: 'Unauthorized' });
   }
 
   try {
-    if (req.method === 'POST' && url.pathname === '/api/login') {
-      const body = await readBody(req);
-      if (!ADMIN_PASSWORD || (body.username === ADMIN_USERNAME && body.password === ADMIN_PASSWORD)) {
-        const sessionToken = createSession();
-        return sendJson(res, 200, { ok: true }, { 'Set-Cookie': makeSessionCookie(req, sessionToken) });
-      }
-      return sendJson(res, 401, { error: 'Invalid username or password' });
+    if (req.method === 'GET' && url.pathname === '/api/me') {
+      const session = currentSession(req);
+      return sendJson(res, 200, { user: session?.user || null });
     }
 
     if (req.method === 'POST' && url.pathname === '/api/logout') {
@@ -737,7 +910,9 @@ async function handleApi(req, res, url) {
         passwordEnvKey: PASSWORD_ENV_KEY,
         defaultInternalPort: DEFAULT_INTERNAL_PORT,
         defaultProfileMountPath: DEFAULT_PROFILE_MOUNT_PATH,
-        authEnabled: Boolean(ADMIN_PASSWORD),
+        authEnabled: GITHUB_AUTH_ENABLED,
+        authProvider: GITHUB_AUTH_ENABLED ? 'github' : 'none',
+        loginUrl: '/auth/github/login',
         reverseProxyAuthEnabled: ENABLE_REVERSE_PROXY_AUTH,
         reverseProxyUserHeader: REVERSE_PROXY_USER_HEADER,
         launchAutoconnect: LAUNCH_AUTOCONNECT,
@@ -942,6 +1117,11 @@ async function handleLaunch(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  if (url.pathname.startsWith('/auth/')) {
+    const authHandled = await handleAuth(req, res, url);
+    if (authHandled !== false) return;
+  }
 
   if (url.pathname.startsWith('/api/')) return handleApi(req, res, url);
 

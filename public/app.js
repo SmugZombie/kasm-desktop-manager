@@ -1,11 +1,10 @@
 // Elements
 const loginOverlay   = document.getElementById('loginOverlay');
-const loginForm      = document.getElementById('loginForm');
-const loginUsername  = document.getElementById('loginUsername');
-const loginPassword  = document.getElementById('loginPassword');
+const githubLoginBtn = document.getElementById('githubLoginBtn');
 const loginMessage   = document.getElementById('loginMessage');
 const appEl          = document.getElementById('app');
 const logoutBtn      = document.getElementById('logoutBtn');
+const currentUserEl  = document.getElementById('currentUser');
 const newDesktopBtn  = document.getElementById('newDesktopBtn');
 const createPanel    = document.getElementById('createPanel');
 const closePanelBtn  = document.getElementById('closePanelBtn');
@@ -61,8 +60,6 @@ function parseLines(text, mode = 'string') {
 function showLogin() {
   loginOverlay.classList.remove('hidden');
   appEl.classList.add('hidden');
-  hideAlert(loginMessage);
-  loginPassword.value = '';
 }
 
 function hideLogin() {
@@ -70,23 +67,26 @@ function hideLogin() {
   appEl.classList.remove('hidden');
 }
 
-loginForm.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  hideAlert(loginMessage);
+function showLoginError() {
+  const params = new URLSearchParams(window.location.search);
+  const error = params.get('auth_error');
+  if (!error) return;
+  showAlert(loginMessage, error);
+  // Drop the query string so a refresh does not keep replaying the error
+  window.history.replaceState({}, '', window.location.pathname);
+}
+
+async function showCurrentUser() {
   try {
-    const res = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: loginUsername.value.trim(), password: loginPassword.value }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) { showAlert(loginMessage, data.error || 'Login failed'); return; }
-    hideLogin();
-    await loadAll();
-  } catch (err) {
-    showAlert(loginMessage, err.message);
+    const { user } = await api('/api/me');
+    if (!user) { currentUserEl.classList.add('hidden'); return; }
+    currentUserEl.textContent = `@${user.login}`;
+    currentUserEl.title = user.email ? `${user.name} · ${user.email}` : user.name;
+    currentUserEl.classList.remove('hidden');
+  } catch {
+    currentUserEl.classList.add('hidden');
   }
-});
+}
 
 logoutBtn.addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
@@ -499,8 +499,10 @@ async function loadAll() {
 }
 
 (async function init() {
+  showLoginError();
   try {
     const config = await fetch('/api/config').then(r => r.json()).catch(() => ({}));
+    if (config.loginUrl) githubLoginBtn.href = config.loginUrl;
     if (config.authEnabled) {
       let authenticated = false;
       try {
@@ -508,6 +510,7 @@ async function loadAll() {
         authenticated = probe.ok;
       } catch { /* network error — treat as unauthenticated */ }
       if (!authenticated) { showLogin(); return; }
+      showCurrentUser();
     }
     hideLogin();
     await loadAll();
